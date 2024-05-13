@@ -854,12 +854,48 @@ func (u *VU) runFn(
 	if u.moduleVUImpl.eventLoop == nil {
 		u.moduleVUImpl.eventLoop = eventloop.New(u.moduleVUImpl)
 	}
-	err = common.RunWithPanicCatching(u.state.Logger, u.Runtime, func() error {
-		return u.moduleVUImpl.eventLoop.Start(func() (err error) {
-			v, err = fn(goja.Undefined(), args...) // Actually run the JS script
+
+	errFn := make(chan error)
+	errEvtLoop := make(chan error)
+
+	go func() {
+		errFn <- common.RunWithPanicCatching(u.state.Logger, u.Runtime, func() error {
+			var err error
+			// Actually run the JS script
+			v, err = fn(goja.Undefined(), args...)
 			return err
 		})
-	})
+	}()
+
+	go func() {
+		errEvtLoop <- common.RunWithPanicCatching(
+			u.state.Logger,
+			u.Runtime,
+			func() error {
+				return u.moduleVUImpl.eventLoop.Start(func() (err error) { return nil })
+			},
+		)
+	}()
+
+	// Wait for the main function to run, or a tick to run functions queued in
+	// eventLoop.
+	err = func() error {
+		tck := time.NewTicker(time.Millisecond * 100)
+		defer tck.Stop()
+
+		for {
+			select {
+			case er := <-errFn:
+				if er != nil {
+					return er
+				}
+				er = <-errEvtLoop
+				return er
+			case <-tck.C:
+				u.moduleVUImpl.eventLoop.WaitOnRegistered()
+			}
+		}
+	}()
 
 	select {
 	case <-ctx.Done():
